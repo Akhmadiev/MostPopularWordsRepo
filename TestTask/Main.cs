@@ -1,7 +1,6 @@
 ﻿namespace TestTask
 {
     using System;
-    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.IO;
     using System.Linq;
@@ -10,167 +9,130 @@
 
     public class Main
     {
-        private static ConcurrentDictionary<string, int> result;
+        private static Queue<Dictionary<string, int>> oDict;
 
-        private static ConcurrentBag<string> input;
-        private static ConcurrentBag<string> output;
+        private static Queue<string> files;
 
-        private static AutoResetEvent evtParse;
-        private static AutoResetEvent evtAggreate;
+        private static object lockAdd;
+
+        private static object lockRead;
 
         private static Regex regex;
 
-        private static string logFile;
+        private static AutoResetEvent evt;
 
-        private static object objLock;
-
-        /// <summary>
-        /// Get 10 most popular words
-        /// </summary>
-        public string GetMostPopularWords()
+        public string Start()
         {
-            result = new ConcurrentDictionary<string, int>();
-
-            evtParse = new AutoResetEvent(false);
-            evtAggreate = new AutoResetEvent(false);
-
-            objLock = new object();
+            lockRead = new object();
+            lockAdd = new object();
+            evt = new AutoResetEvent(false);
 
             regex = new Regex(@"\w+", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-            var currentDirectory = Directory.GetCurrentDirectory();
+            var procCount = Environment.ProcessorCount;
 
-            var files = Directory.GetFiles($"{currentDirectory}\\files", "*.txt");
-            logFile = $"{currentDirectory}\\logs\\error.txt";
+            oDict = new Queue<Dictionary<string, int>>();
 
-            for (var i = 0; i < Environment.ProcessorCount - 1; i++)
+            var threads = new List<Thread>(procCount);
+
+            files = new Queue<string>(Directory.GetFiles($"{Directory.GetCurrentDirectory()}", "*.txt", SearchOption.AllDirectories));
+
+            for (var i = 0; i < procCount; i++)
             {
-                new Thread(Parse) { IsBackground = true, Name = i.ToString() }.Start();
+                var thread = new Thread(Parse) { IsBackground = true };
+                thread.Start();
+
+                threads.Add(thread);
             }
 
-            new Thread(Aggregate) { IsBackground = true }.Start();
+            evt.WaitOne();
+            var result = oDict.Dequeue();
 
-            foreach (var file in files)
+            while (threads.Any(x => x.IsAlive))
             {
-                var count = File.ReadLines(file).Count();
+                evt.WaitOne();
 
-                input = new ConcurrentBag<string>(new List<string>(count));
-                output = new ConcurrentBag<string>(new List<string>(count));
-
-                using (var reader = new StreamReader(file))
+                while (oDict.Count > 0)
                 {
-                    while (!reader.EndOfStream)
+                    foreach (var dict in oDict.Dequeue())
                     {
-                        input.Add(reader.ReadLine());
-                        evtParse.Set();
+                        result.TryGetValue(dict.Key, out int value);
+                        if (value != 0)
+                        {
+                            result[dict.Key] = value + dict.Value;
+                        }
+                        else
+                        {
+                            result.Add(dict.Key, dict.Value);
+                        }
                     }
-                }
-
-                if (!input.IsEmpty)
-                {
-                    AddRows();
-                }
-
-                if (!output.IsEmpty)
-                {
-                    AddResult();
                 }
             }
 
             return string.Join(", ", result.OrderByDescending(x => x.Value).Select(x => x.Key).Take(10));
         }
 
-        /// <summary>
-        /// Parse from line to row
-        /// </summary>
         private static void Parse()
         {
             try
             {
-                while (true)
+                while (files.Count > 0)
                 {
-                   evtParse.WaitOne();
+                    var file = "";
+                    lock (lockRead)
+                    {
+                        if (files.Any())
+                        {
+                            file = files.Dequeue();
+                        }
+                        else
+                        {
+                            return;
+                        }
+                    }
 
-                    AddRows();
+                    var iDict = new Dictionary<string, int>();
+
+                    using (var reader = new StreamReader(file))
+                    {
+                        while (!reader.EndOfStream)
+                        {
+                            var mathces = regex.Matches(reader.ReadLine());
+
+                            for (int i = 0; i < mathces.Count; i++)
+                            {
+                                var match = mathces[i];
+
+                                iDict.TryGetValue(match.Value, out int value);
+                                if (value != 0)
+                                {
+                                    iDict[match.Value] = value + 1;
+                                }
+                                else
+                                {
+                                    iDict.Add(match.Value, 1);
+                                }
+                            }
+                        }
+
+                        lock (lockAdd)
+                        {
+                            oDict.Enqueue(iDict);
+                            evt.Set();
+                        }
+                    }
                 }
             }
-            catch(Exception e)
+            catch (Exception e)
             {
-                lock(objLock)
-                {
-                    LogError(e.ToString());
-                }
+                LogError(e.ToString());
             }
         }
 
-        /// <summary>
-        ///  Add value to output bag (ConcurrentBag<string>)
-        /// </summary>
-        private static void AddRows()
-        {
-            while (!input.IsEmpty)
-            {
-                input.TryTake(out string text);
 
-                if (string.IsNullOrWhiteSpace(text))
-                {
-                    continue;
-                }
-
-                var mathces = regex.Matches(text);
-                foreach (Match match in mathces)
-                {
-                    output.Add(match.Value);
-                    evtAggreate.Set();
-                }
-            }
-        }
-
-        /// <summary>
-        /// Aggregate data from output bag
-        /// </summary>
-        private static void Aggregate()
-        {
-            try
-            {
-                while (true)
-                {
-                    evtAggreate.WaitOne();
-
-                    AddResult();
-                }
-            }
-            catch(Exception e)
-            {
-                lock (objLock)
-                {
-                    LogError(e.ToString());
-                }
-            }
-        }
-
-        /// <summary>
-        /// Add values to result dictionary
-        /// </summary>
-        private static void AddResult()
-        {
-            while (!output.IsEmpty)
-            {
-                output.TryTake(out string value);
-
-                if (!string.IsNullOrWhiteSpace(value))
-                {
-                    result.AddOrUpdate(value, 1, (x, oldValue) => oldValue + 1);
-                }
-            }
-        }
-
-        /// <summary>
-        /// Write error in log file
-        /// </summary>
         private static void LogError(string message)
         {
-            using (var streamWriter = new StreamWriter(logFile, true))
+            using (var streamWriter = new StreamWriter($"{Directory.GetCurrentDirectory()}\\logs\\error.txt", true))
             {
                 streamWriter.WriteLine($"{DateTime.Now}");
                 streamWriter.WriteLine(message);
